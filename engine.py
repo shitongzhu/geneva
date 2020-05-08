@@ -5,33 +5,34 @@ Given a strategy and a server port, the engine configures NFQueue
 so the strategy can run on the underlying connection.
 """
 
+import actions.utils
+import actions.strategy
+import actions.packet
+from scapy.config import conf
+from scapy.utils import wrpcap
+from scapy.layers.inet import IP
+from scapy.all import L3RawSocket, send
+import netfilterqueue
+import time
+import threading
+import subprocess
+import socket
+import os
 import argparse
 import logging
 logging.getLogger("scapy.runtime").setLevel(logging.ERROR)
-import os
-import socket
-import subprocess
-import threading
-import time
 
-import netfilterqueue
-
-from scapy.layers.inet import IP
-from scapy.utils import wrpcap
-from scapy.config import conf
 
 socket.setdefaulttimeout(1)
 
-import actions.packet
-import actions.strategy
-import actions.utils
 
 BASEPATH = os.path.dirname(os.path.abspath(__file__))
 
 
 class Engine():
-    def __init__(self, server_port, string_strategy, server_side=False, environment_id=None, output_directory="trials", log_level="info"):
+    def __init__(self, server_port, iface, string_strategy, server_side=False, environment_id=None, output_directory="trials", log_level="info"):
         self.server_port = server_port
+        self.iface = iface
         self.seen_packets = []
         # Set up the directory and ID for logging
         actions.utils.setup_dirs(output_directory)
@@ -66,7 +67,8 @@ class Engine():
         # for scapy to send packets more quickly than using just send(), as under the hood
         # send() creates and then destroys a socket each time, imparting a large amount
         # of overhead.
-        self.socket = conf.L3socket(iface=actions.utils.get_interface())
+        conf.L3socket = L3RawSocket
+        conf.iface = self.iface
 
     def __enter__(self):
         """
@@ -88,7 +90,7 @@ class Engine():
         """
         try:
             self.logger.debug("Sending packet %s", str(packet))
-            self.socket.send(packet.packet)
+            send(packet.packet[IP])
         except Exception:
             self.logger.exception("Error in engine mysend.")
 
@@ -116,7 +118,8 @@ class Engine():
                 except socket.timeout:
                     pass
         except Exception:
-            self.logger.exception("Exception out of run_nfqueue() (direction=%s)", direction)
+            self.logger.exception(
+                "Exception out of run_nfqueue() (direction=%s)", direction)
 
     def configure_iptables(self, remove=False):
         """
@@ -124,7 +127,8 @@ class Engine():
         """
         self.logger.debug("Configuring iptables rules")
 
-        port1, port2 = "dport", "sport"
+        if self.server_port != -1:
+            port1, port2 = "dport", "sport"
         if self.server_side:
             port1, port2 = "sport", "dport"
 
@@ -136,11 +140,18 @@ class Engine():
         if remove:
             add_or_remove = "D"
         cmds = []
-        for proto in ["tcp", "udp"]:
-            cmds += ["iptables -%s %s -p %s --%s %d -j NFQUEUE --queue-num 1" %
-                     (add_or_remove, out_chain, proto, port1, self.server_port),
-                     "iptables -%s %s -p %s --%s %d -j NFQUEUE --queue-num 2" %
-                     (add_or_remove, in_chain, proto, port2, self.server_port)]
+        for proto in ["tcp"]:
+            if self.server_port != -1:
+                cmds += ["iptables -%s %s -p %s -o %s --%s %d -j NFQUEUE --queue-num 1" %
+                         (add_or_remove, out_chain, proto,
+                          self.iface, port1, self.server_port),
+                         "iptables -%s %s -p %s -i %s --%s %d -j NFQUEUE --queue-num 2" %
+                         (add_or_remove, in_chain, proto, self.iface, port2, self.server_port)]
+            else:
+                cmds += ["iptables -%s %s -p %s -o %s -j NFQUEUE --queue-num 1" %
+                         (add_or_remove, out_chain, proto, self.iface),
+                         "iptables -%s %s -p %s -i %s -j NFQUEUE --queue-num 2" %
+                         (add_or_remove, in_chain, proto, self.iface)]
 
         for cmd in cmds:
             self.logger.debug(cmd)
@@ -149,7 +160,8 @@ class Engine():
             if actions.utils.get_console_log_level() == logging.DEBUG:
                 subprocess.check_call(cmd.split(), timeout=60)
             else:
-                subprocess.check_call(cmd.split(), stderr=subprocess.DEVNULL, stdout=subprocess.DEVNULL, timeout=60)
+                subprocess.check_call(
+                    cmd.split(), stderr=subprocess.DEVNULL, stdout=subprocess.DEVNULL, timeout=60)
         return cmds
 
     def initialize_nfqueue(self):
@@ -186,7 +198,7 @@ class Engine():
         self.in_nfqueue_thread.start()
         self.out_nfqueue_thread.start()
 
-        maxwait = 100 # 100 time steps of 0.01 seconds for a max wait of 10 seconds
+        maxwait = 100  # 100 time steps of 0.01 seconds for a max wait of 10 seconds
         i = 0
         # Give NFQueue time to startup, since it's running in background threads
         # Block the main thread until this is done
@@ -252,14 +264,16 @@ class Engine():
         """
         Handles processing an outbound packet through the engine.
         """
-        packets_to_send = self.strategy.act_on_packet(packet, self.logger, direction="out")
+        packets_to_send = self.strategy.act_on_packet(
+            packet, self.logger, direction="out")
 
         # Send all of the packets we've collected to send
         for out_packet in packets_to_send:
             # If the strategy requested us to sleep before sending this packet, do so here
             if out_packet.sleep:
                 # We can't block the main sending thread, so instead spin off a new thread to handle sleeping
-                threading.Thread(target=self.delayed_send, args=(out_packet, out_packet.sleep)).start()
+                threading.Thread(target=self.delayed_send, args=(
+                    out_packet, out_packet.sleep)).start()
             else:
                 self.mysend(out_packet)
 
@@ -277,7 +291,8 @@ class Engine():
         self.logger.debug("Received packet: %s", str(packet))
 
         # Run the given strategy
-        packets = self.strategy.act_on_packet(packet, self.logger, direction="in")
+        packets = self.strategy.act_on_packet(
+            packet, self.logger, direction="in")
 
         # Censors will often send RA packets to disrupt a TCP stream - record this
         if packet.haslayer("TCP") and packet.get("TCP", "flags") == "RA":
@@ -304,14 +319,23 @@ def get_args():
     """
     Sets up argparse and collects arguments.
     """
-    parser = argparse.ArgumentParser(description='The engine that runs a given strategy.')
-    parser.add_argument('--server-port', type=int, action='store', required=True)
-    parser.add_argument('--server-side', action='store_true', help="If this strategy is running on the server side of a connection")
-    parser.add_argument('--environment-id', action='store', help="ID of the current strategy under test. If not provided, one will be generated.")
-    parser.add_argument('--strategy', action='store', help="Strategy to deploy")
-    parser.add_argument('--output-directory', default="trials", action='store', help="Where to output logs, captures, and results. Defaults to trials/.")
+    parser = argparse.ArgumentParser(
+        description='The engine that runs a given strategy.')
+    parser.add_argument('--server-port', type=int,
+                        action='store', default=-1)
+    parser.add_argument('--server-side', action='store_true',
+                        help="If this strategy is running on the server side of a connection")
+    parser.add_argument('--environment-id', action='store',
+                        help="ID of the current strategy under test. If not provided, one will be generated.")
+    parser.add_argument('--strategy', action='store',
+                        help="Strategy to deploy")
+    parser.add_argument('--iface', action='store',
+                        help="Interface to listen on.")
+    parser.add_argument('--output-directory', default="trials", action='store',
+                        help="Where to output logs, captures, and results. Defaults to trials/.")
     parser.add_argument('--log', action='store', default="debug",
-                        choices=("debug", "info", "warning", "critical", "error"),
+                        choices=("debug", "info", "warning",
+                                 "critical", "error"),
                         help="Sets the log level")
 
     args = parser.parse_args()
@@ -324,9 +348,10 @@ def main(args):
     """
     try:
         eng = Engine(args["server_port"],
+                     args["iface"],
                      args["strategy"],
                      environment_id=args.get("environment_id"),
-                     output_directory = args.get("output_directory"),
+                     output_directory=args.get("output_directory"),
                      server_side=args.get("server_side"),
                      log_level=args["log"])
         eng.initialize_nfqueue()
